@@ -102,7 +102,7 @@ class RepoAgent:
         path = Path(repo_path) / file_path
         path.write_text(content, encoding="utf-8")
 
-    def commit_push(self, repo_path):
+    def commit_push(self, repo_path, repo_name):
         repo = Repo(repo_path)
 
         branch = "ai-update"
@@ -116,7 +116,19 @@ class RepoAgent:
 
         if repo.is_dirty(untracked_files=True):
             repo.index.commit("AI Agent Update")
-            repo.remote("origin").push(branch)
+
+            # Force authenticated remote for Streamlit Cloud
+            remote_url = (
+                f"https://{self.token}@github.com/"
+                f"{repo_name}.git"
+            )
+
+            origin = repo.remote("origin")
+            origin.set_url(remote_url)
+
+            origin.push(
+                refspec=f"{branch}:{branch}"
+            )
 
         return branch
 
@@ -242,7 +254,10 @@ if github_token:
             )
 
         with st.spinner("Committing and pushing..."):
-            branch = repo_agent.commit_push(repo_path)
+            branch = repo_agent.commit_push(
+                repo_path,
+                selected_repo
+            )
 
         st.success("Done! 🚀")
         st.write(f"Branch: {branch}")
