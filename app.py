@@ -830,15 +830,27 @@ with main_tabs[0]:
                 active_proj()["history"].append({"role": "agent", "text": summary})
 
                 # Refresh preview
-                html = vfs.get_entry_html()
-                if html:
-                    active_proj()["last_preview_html"] = vfs.inject_css_js(html)
-                save_project()
+               html = vfs.get_entry_html()
 
-                reply = f"✅ {summary} — switch to the Preview tab to see it!"
-                active_proj()["chat_history"].append(
-                    {"role": "assistant", "content": reply}
-                )
+if html:
+    rendered_html = vfs.inject_css_js(html)
+
+    # save preview into project
+    active_proj()["last_preview_html"] = rendered_html
+
+    # force refresh flag
+    st.session_state["preview_ready"] = True
+
+save_project()
+
+reply = "✅ Build complete — preview updated!"
+
+active_proj()["chat_history"].append(
+    {
+        "role": "assistant",
+        "content": reply
+    }
+)
 
             else:
                 # ── CHAT PATH ──
@@ -917,16 +929,17 @@ with main_tabs[1]:
 
         st.divider()
 
-        # ── iframe preview ───────────────────────────
-        cache_bust = hashlib.md5(preview_html.encode()).hexdigest()[:8]
-        st.markdown(
-            f"<span style='font-family:monospace;color:#606080;font-size:11px'>"
-            f"local preview · hash:{cache_bust}</span>",
-            unsafe_allow_html=True,
-        )
-        encoded = base64.b64encode(preview_html.encode()).decode()
-        iframe_src = f"data:text/html;base64,{encoded}"
-        st.components.v1.iframe(iframe_src, height=650, scrolling=True)
+       # ── Preview ───────────────────────────
+preview_html = active_proj().get("last_preview_html")
+
+if preview_html:
+    st.components.v1.html(
+        preview_html,
+        height=700,
+        scrolling=True
+    )
+else:
+    st.warning("No preview available yet.")
 
 
 # ──────────── TAB 3 : EDITOR ────────────────
