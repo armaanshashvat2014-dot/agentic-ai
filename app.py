@@ -180,17 +180,48 @@ class AIClient:
                 return data["choices"][0]["message"]["content"]
         return str(data)
 
+    def chat(self, conversation: list[dict]) -> str:
+        """Send a multi-turn chat conversation, prepending the chat system prompt."""
+        # Prepend system prompt as a strong first user turn + assistant ack
+        full_messages = [
+            {"role": "user",      "content": CHAT_SYSTEM_PROMPT + "\n\nAcknowledge these rules briefly."},
+            {"role": "assistant", "content": "Understood. I am Forge AI, your web app building assistant. I only help with coding, building, and web development. What would you like to build?"},
+        ] + conversation
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {"messages": full_messages}
+        resp = requests.post(AI_ENDPOINT, headers=headers,
+                             json=payload, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if isinstance(data, dict):
+            if "response" in data:
+                return data["response"]
+            if "content" in data:
+                cnt = data["content"]
+                if isinstance(cnt, list):
+                    return cnt[0].get("text", str(cnt))
+                return cnt
+            if "message" in data:
+                return data["message"]
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"]
+        return str(data)
+
 
 # ─────────────────────────────────────────────
 # AGENT CORE
 # ─────────────────────────────────────────────
-SYSTEM_PROMPT = """You are Forge, an elite autonomous frontend coding AI.
+# System prompts for different modes
+AGENT_SYSTEM_PROMPT = """IMPORTANT: You are Forge, an autonomous web app builder. You output ONLY raw JSON — no prose, no markdown, no explanations, no web searches.
 
-Your job: make ONLY the changes the user asks for. Nothing else.
+TASK: Make exactly the change the user requests. Nothing more.
 
-STRICT RULES — read every one carefully:
-1. Return ONLY a valid JSON object. No markdown fences, no explanation, no extra text.
-2. Shape:
+OUTPUT FORMAT — return this exact JSON shape and nothing else:
 {
   "summary": "one-line description of what you changed",
   "actions": [
@@ -199,17 +230,48 @@ STRICT RULES — read every one carefully:
     { "type": "delete", "path": "old.js" }
   ]
 }
-3. Types: "create" (new file), "edit" (full new content of file), "delete" (remove file).
-4. PRESERVATION LAW — THE MOST IMPORTANT RULE:
-   - When editing an existing project, you receive the COMPLETE current content of every file.
-   - You MUST copy all existing content into the "content" field, then apply ONLY the requested change on top.
-   - NEVER drop features, sections, styles, functions, or text that already exist unless the user explicitly asked to remove them.
-   - If a file does not need to change at all, do NOT include it in actions.
-   - Think of yourself as a surgeon: make a precise incision, change only what was asked, leave everything else exactly as-is.
-5. Build production-quality, visually stunning apps. Use Tailwind CDN, Google Fonts, or vanilla CSS.
-6. Apps must work end-to-end: real interactivity, real data, real UX.
-7. For multi-file projects, index.html must link to all other files.
-"""
+
+RULES:
+- "create" = new file, "edit" = full replacement content, "delete" = remove.
+- PRESERVATION: You receive the COMPLETE current file contents. Copy ALL existing content into "content", then apply only the requested change on top. NEVER remove features, functions, styles, or text unless explicitly asked.
+- Only include files that actually change. Unchanged files: omit entirely.
+- Build production-quality, visually stunning apps. Tailwind CDN, Google Fonts, or vanilla CSS.
+- Apps must be fully interactive and functional end-to-end.
+- Do NOT search the web. Do NOT return prose. Return JSON only.
+
+CRITICAL RULE FOR AI-POWERED APPS:
+If the app you are building contains a chat interface or calls an AI API, you MUST follow this pattern exactly:
+
+The app calls this endpoint:
+  POST https://raujzsawwpmixwlcgcgs.supabase.co/functions/v1/public-ai-api
+  Headers: { "Authorization": "Bearer FORGE_AI_KEY_PLACEHOLDER", "Content-Type": "application/json" }
+
+The request body MUST always include a strong system prompt prepended as the first user message, followed by an assistant acknowledgement, then the real conversation. Example:
+
+  const SYSTEM_PROMPT = "You are [AppName] AI. You are a helpful assistant for [purpose]. STRICT RULES: 1) Never perform web searches or return search results. 2) Only answer questions relevant to [purpose]. 3) If asked off-topic questions, politely redirect to [purpose]. 4) Keep answers concise and helpful.";
+
+  const messages = [
+    { role: "user", content: SYSTEM_PROMPT + "\\n\\nAcknowledge your role briefly." },
+    { role: "assistant", content: "Understood. I am [AppName] AI, ready to help with [purpose]." },
+    ...conversationHistory,
+    { role: "user", content: userInput }
+  ];
+
+The key FORGE_AI_KEY_PLACEHOLDER will be injected at runtime — always use exactly that string as the Bearer token.
+Never use fetch with no system prompt. Always anchor the AI's persona this way."""
+
+CHAT_SYSTEM_PROMPT = """You are Forge AI, a friendly assistant built into a web app builder called Forge.
+Your personality: helpful, concise, focused on coding and building web apps.
+
+STRICT RULES:
+- You are NOT a search engine. NEVER perform web searches or return search results.
+- ONLY answer questions related to: web development, app ideas, how to use Forge, coding help, UI/UX advice.
+- If someone asks something off-topic (news, general knowledge, trivia, etc.), politely redirect them: explain you are a coding assistant and ask what they'd like to build.
+- Keep answers short and practical. Use plain text, no markdown headers.
+- If the user describes an app idea, ask one clarifying question to help them refine it, then encourage them to hit Build."""
+
+# Keep backward-compat alias
+SYSTEM_PROMPT = AGENT_SYSTEM_PROMPT
 
 
 def run_agent(ai: AIClient, vfs: VirtualFS, task: str,
@@ -234,7 +296,7 @@ def run_agent(ai: AIClient, vfs: VirtualFS, task: str,
     else:
         user_msg = f"TASK: {task}\n\nBuild this from scratch. Return the complete project JSON."
 
-    raw = ai.ask(SYSTEM_PROMPT, user_msg, max_tokens=8192)
+    raw = ai.ask(AGENT_SYSTEM_PROMPT, user_msg, max_tokens=8192)
 
     # Strip accidental markdown fences
     raw = raw.strip()
@@ -251,6 +313,9 @@ def run_agent(ai: AIClient, vfs: VirtualFS, task: str,
         t = action.get("type")
         path = action.get("path", "").lstrip("/")
         content = action.get("content", "")
+        # Inject the real API key into generated apps that use the placeholder
+        if isinstance(content, str):
+            content = content.replace("FORGE_AI_KEY_PLACEHOLDER", AI_KEY)
         if t in ("create", "edit"):
             vfs.write(path, content)
         elif t == "delete":
@@ -435,6 +500,7 @@ def init_state():
     defaults = {
         "vfs": None,
         "history": [],        # list of {"role": "user"|"agent", "text": str}
+        "chat_history": [],   # list of {"role": "user"|"assistant", "content": str}
         "build_log": [],
         "selected_file": None,
         "project_name": "untitled",
@@ -528,98 +594,148 @@ with st.sidebar:
 main_tabs = st.tabs(["🏗 Build", "👁 Preview", "📂 Editor", "📜 History"])
 
 
-# ──────────── TAB 1 : BUILD ─────────────────
+# ──────────── TAB 1 : BUILD + CHAT ─────────────────
 with main_tabs[0]:
-    st.markdown("### What should Forge build?")
 
-    prompt = st.text_area(
-        "Describe your app",
-        height=120,
-        placeholder=(
-            "e.g. A Pomodoro timer with dark mode, animated progress ring, "
-            "and session history stored in localStorage."
-        ),
-        key="prompt_input",
-        label_visibility="collapsed",
-    )
+    # ── Chat history display ──────────────────────────
+    chat_container = st.container()
+    with chat_container:
+        if not st.session_state["chat_history"]:
+            st.markdown(
+                '''<div style="text-align:center;padding:40px 0 20px;
+                    font-family:IBM Plex Mono,monospace;color:#606080;font-size:13px;">
+                    ⚡ Tell Forge what to build — or ask anything about web dev.
+                </div>''',
+                unsafe_allow_html=True,
+            )
+        for msg in st.session_state["chat_history"]:
+            role = msg["role"]
+            text = msg["content"]
+            is_user = role == "user"
+            bubble_bg    = "#2a2a3e" if is_user else "#12121c"
+            bubble_align = "flex-end" if is_user else "flex-start"
+            icon = "🧑" if is_user else "⚡"
+            st.markdown(
+                f'''<div style="display:flex;justify-content:{bubble_align};margin:6px 0;">
+                  <div style="background:{bubble_bg};border-radius:10px;padding:10px 14px;
+                       max-width:80%;font-family:IBM Plex Mono,monospace;font-size:13px;
+                       color:#e8e6e3;line-height:1.5;">
+                  {icon}&nbsp; {text}
+                  </div></div>''',
+                unsafe_allow_html=True,
+            )
 
-    col1, col2 = st.columns([2, 1])
+    st.divider()
+
+    # ── Input row ────────────────────────────────────
+    col1, col2, col3 = st.columns([6, 2, 2])
     with col1:
-        build_clicked = st.button("⚡ Build / Update", type="primary",
-                                  use_container_width=True)
+        prompt = st.text_area(
+            "Message",
+            height=80,
+            placeholder="Build a todo app… or ask a question…",
+            key="prompt_input",
+            label_visibility="collapsed",
+        )
     with col2:
-        mode = st.radio("Mode", ["Create from scratch", "Edit existing"],
-                        horizontal=True,
+        build_clicked = st.button("⚡ Build", type="primary",
+                                  use_container_width=True)
+    with col3:
+        mode = st.radio("Mode", ["✨ New", "✏️ Edit"],
+                        horizontal=False,
                         index=0 if not vfs.list_files() else 1)
 
-    # ── RUN AGENT ──────────────────────────────
+    # ── Detect intent: build vs chat ────────────────
+    BUILD_VERBS = [
+        "build", "create", "make", "add", "generate", "write", "update",
+        "change", "fix", "edit", "remove", "delete", "refactor", "style",
+        "implement", "deploy", "convert", "migrate", "improve", "redesign",
+        "dark mode", "light mode", "responsive", "mobile", "feature",
+    ]
+
+    def is_build_intent(text: str) -> bool:
+        t = text.lower()
+        return any(v in t for v in BUILD_VERBS)
+
+    # ── RUN ─────────────────────────────────────────
     if build_clicked:
         if not AI_KEY:
             st.error("⚠️  Set the `COMPLEX_AI_KEY` environment variable to use Forge AI.")
         elif not prompt.strip():
-            st.warning("Please enter a prompt.")
+            st.warning("Please enter a message.")
         else:
             ai = AIClient(AI_KEY)
+            user_text = prompt.strip()
 
-            existing = (
-                dict(vfs.files)
-                if mode == "Edit existing" and vfs.list_files()
-                else None
+            # Add user message to chat
+            st.session_state["chat_history"].append(
+                {"role": "user", "content": user_text}
             )
 
-            log_placeholder = st.empty()
-            status_msgs = [
-                "🤖  Prompting Forge AI…",
-                "✏️  Generating code…",
-                "📁  Writing files to virtual FS…",
-            ]
-
-            with st.spinner("Forge is building…"):
-                log_placeholder.markdown(
-                    '<div class="build-log">'
-                    + "<br>".join(f"› {m}" for m in status_msgs[:1])
-                    + "</div>",
-                    unsafe_allow_html=True,
+            if is_build_intent(user_text) or "✨ New" in mode:
+                # ── BUILD PATH ──
+                existing = (
+                    dict(vfs.files)
+                    if "✏️ Edit" in mode and vfs.list_files()
+                    else None
                 )
-                try:
-                    result = run_agent(ai, vfs, prompt.strip(), existing)
-                except json.JSONDecodeError as e:
-                    st.error(f"AI returned invalid JSON: {e}")
-                    st.stop()
-                except requests.HTTPError as e:
-                    st.error(f"API error: {e}")
-                    st.stop()
-                except Exception as e:
-                    st.error(f"Unexpected error: {e}")
-                    st.stop()
 
-            summary = result.get("summary", "Done.")
-            actions = result.get("actions", [])
+                with st.spinner("⚡ Forge is building…"):
+                    try:
+                        result = run_agent(ai, vfs, user_text, existing)
+                    except json.JSONDecodeError as e:
+                        err = f"AI returned invalid JSON — try rephrasing. ({e})"
+                        st.session_state["chat_history"].append(
+                            {"role": "assistant", "content": err}
+                        )
+                        st.rerun()
+                    except Exception as e:
+                        err = f"Error: {e}"
+                        st.session_state["chat_history"].append(
+                            {"role": "assistant", "content": err}
+                        )
+                        st.rerun()
 
-            # Update build log
-            log_lines = [f"✅ {summary}", ""]
-            for a in actions:
-                icon = {"create": "➕", "edit": "✏️", "delete": "🗑"}.get(a.get("type"), "•")
-                log_lines.append(f"{icon}  {a.get('path','?')}")
+                summary = result.get("summary", "Done.")
+                actions = result.get("actions", [])
 
-            st.session_state["build_log"].extend(log_lines)
-            st.session_state["history"].append({"role": "user",   "text": prompt.strip()})
-            st.session_state["history"].append({"role": "agent",  "text": summary})
+                # Build log
+                log_lines = [f"✅ {summary}", ""]
+                for a in actions:
+                    icon = {"create": "➕", "edit": "✏️", "delete": "🗑"}.get(a.get("type"), "•")
+                    log_lines.append(f"{icon}  {a.get('path','?')}")
+                st.session_state["build_log"].extend(log_lines)
+                st.session_state["history"].append({"role": "user",  "text": user_text})
+                st.session_state["history"].append({"role": "agent", "text": summary})
 
-            # Cache preview HTML
-            html = vfs.get_entry_html()
-            if html:
-                st.session_state["last_preview_html"] = vfs.inject_css_js(html)
+                # Refresh preview
+                html = vfs.get_entry_html()
+                if html:
+                    st.session_state["last_preview_html"] = vfs.inject_css_js(html)
 
-            log_placeholder.markdown(
-                '<div class="build-log">'
-                + "<br>".join(f"› {l}" for l in log_lines)
-                + "</div>",
-                unsafe_allow_html=True,
-            )
+                reply = f"✅ {summary} — switch to the Preview tab to see it!"
+                st.session_state["chat_history"].append(
+                    {"role": "assistant", "content": reply}
+                )
 
-            st.success(f"✅ {summary}")
-            st.info("Switch to the **Preview** tab to see your app!")
+            else:
+                # ── CHAT PATH ──
+                # Build conversation list for the AI (role: user/assistant only)
+                conversation = [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in st.session_state["chat_history"]
+                ]
+                with st.spinner("Thinking…"):
+                    try:
+                        reply = ai.chat(conversation)
+                    except Exception as e:
+                        reply = f"Sorry, I hit an error: {e}"
+
+                st.session_state["chat_history"].append(
+                    {"role": "assistant", "content": reply}
+                )
+
+            st.rerun()
 
     # Build log (persistent)
     if st.session_state["build_log"]:
