@@ -186,24 +186,29 @@ class AIClient:
 # ─────────────────────────────────────────────
 SYSTEM_PROMPT = """You are Forge, an elite autonomous frontend coding AI.
 
-Your job: turn a user prompt into a complete, beautiful, WORKING web app.
+Your job: make ONLY the changes the user asks for. Nothing else.
 
-Rules:
-1. Always return ONLY a valid JSON object — no markdown fences, no extra text.
-2. The JSON must have exactly this shape:
+STRICT RULES — read every one carefully:
+1. Return ONLY a valid JSON object. No markdown fences, no explanation, no extra text.
+2. Shape:
 {
-  "summary": "one-line description of what you built / changed",
+  "summary": "one-line description of what you changed",
   "actions": [
     { "type": "create", "path": "index.html", "content": "..." },
     { "type": "edit",   "path": "style.css",  "content": "..." },
     { "type": "delete", "path": "old.js" }
   ]
 }
-3. Types: "create" (new file), "edit" (overwrite), "delete" (remove).
-4. Build production-quality, visually stunning apps. Use Tailwind CDN, Google Fonts, or vanilla CSS — whatever fits best.
-5. Make apps that actually work end-to-end: real interactivity, real data, real UX.
-6. For multi-file projects, always produce a self-contained index.html that links to the other files.
-7. When editing an existing project, receive the current file tree and produce ONLY the files that change.
+3. Types: "create" (new file), "edit" (full new content of file), "delete" (remove file).
+4. PRESERVATION LAW — THE MOST IMPORTANT RULE:
+   - When editing an existing project, you receive the COMPLETE current content of every file.
+   - You MUST copy all existing content into the "content" field, then apply ONLY the requested change on top.
+   - NEVER drop features, sections, styles, functions, or text that already exist unless the user explicitly asked to remove them.
+   - If a file does not need to change at all, do NOT include it in actions.
+   - Think of yourself as a surgeon: make a precise incision, change only what was asked, leave everything else exactly as-is.
+5. Build production-quality, visually stunning apps. Use Tailwind CDN, Google Fonts, or vanilla CSS.
+6. Apps must work end-to-end: real interactivity, real data, real UX.
+7. For multi-file projects, index.html must link to all other files.
 """
 
 
@@ -212,24 +217,19 @@ def run_agent(ai: AIClient, vfs: VirtualFS, task: str,
     """
     Run the AI agent.  Returns {"summary": str, "actions": list}.
     """
-    # Build user message
     if existing_files:
-        file_summary = "\n".join(
-            f"[{path}] ({len(content)} chars)"
-            for path, content in existing_files.items()
-        )
-        # Include content of small files for context
+        # Always send FULL content of every file so AI can preserve it correctly
         snippets = []
         for path, content in existing_files.items():
-            if len(content) < 2000:
-                snippets.append(f"### {path}\n```\n{content}\n```")
-        file_detail = "\n".join(snippets) if snippets else "(files too large to include)"
+            snippets.append(f"### {path}\n```\n{content}\n```")
+        file_detail = "\n\n".join(snippets)
 
         user_msg = (
             f"TASK: {task}\n\n"
-            f"CURRENT PROJECT FILES:\n{file_summary}\n\n"
-            f"FILE CONTENTS (small files):\n{file_detail}\n\n"
-            "Return the JSON with ONLY the files that need to change."
+            f"CURRENT PROJECT FILES (complete content — preserve everything not mentioned):\n\n{file_detail}\n\n"
+            "Return ONLY the files that need to change. "
+            "For each changed file, include its FULL new content (existing content + your edits). "
+            "Do NOT include files that are unchanged."
         )
     else:
         user_msg = f"TASK: {task}\n\nBuild this from scratch. Return the complete project JSON."
