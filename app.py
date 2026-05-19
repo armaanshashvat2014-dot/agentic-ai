@@ -9,6 +9,7 @@ import uuid
 import zipfile
 import io
 import base64
+import hashlib
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -46,58 +47,45 @@ SCRAPE_HEADERS = {
 
 
 def scrape_url(url: str, timeout: int = 15) -> dict:
-    """
-    Fetch a URL and return a structured digest for the AI.
-    """
     result = {
         "url": url, "title": "", "html_raw": "", "inline_styles": "",
         "inline_scripts": "", "linked_css_urls": [], "linked_js_urls": [],
         "text_content": "", "meta": {}, "error": None,
     }
     try:
-        resp = requests.get(url, headers=SCRAPE_HEADERS, timeout=timeout,
-                            allow_redirects=True)
+        resp = requests.get(url, headers=SCRAPE_HEADERS, timeout=timeout, allow_redirects=True)
         resp.raise_for_status()
         raw = resp.text
 
-        # title
         m = re.search(r"<title[^>]*>(.*?)</title>", raw, re.I | re.S)
         result["title"] = m.group(1).strip() if m else ""
 
-        # meta tags
         for m in re.finditer(
             r'<meta\s+(?:name|property)=["\']([^"\']+)["\'][^>]*content=["\']([^"\']*)["\']',
             raw, re.I
         ):
             result["meta"][m.group(1)] = m.group(2)
 
-        # inline <style> blocks
         styles = re.findall(r"<style[^>]*>(.*?)</style>", raw, re.I | re.S)
         result["inline_styles"] = "\n\n".join(styles)[:30_000]
 
-        # inline <script> blocks (no src=)
         scripts = re.findall(
             r"<script(?![^>]*\bsrc\b)[^>]*>(.*?)</script>", raw, re.I | re.S
         )
         result["inline_scripts"] = "\n\n".join(scripts)[:30_000]
 
-        # linked CSS / JS
         css_links = re.findall(
-            r'<link[^>]+rel=["\']stylesheet["\'][^>]*href=["\']([^"\']+)["\']',
-            raw, re.I
+            r'<link[^>]+rel=["\']stylesheet["\'][^>]*href=["\']([^"\']+)["\']', raw, re.I
         )
         result["linked_css_urls"] = [urljoin(url, h) for h in css_links[:8]]
 
         js_links = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', raw, re.I)
         result["linked_js_urls"] = [urljoin(url, s) for s in js_links[:8]]
 
-        # visible text
         text = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", raw, flags=re.I | re.S)
         text = re.sub(r"<[^>]+>", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
         result["text_content"] = text[:15_000]
-
-        # raw HTML (capped)
         result["html_raw"] = raw[:80_000]
 
     except Exception as e:
@@ -226,31 +214,229 @@ class VirtualFS:
 
 
 # ─────────────────────────────────────────────
-# LIVE PREVIEW SERVER
+# GITHUB API CLIENT (no gitpython needed)
 # ─────────────────────────────────────────────
-_server_lock = threading.Lock()
+class GitHubClient:
+    """
+    Pure REST-based GitHub integration.
+    Supports: create repo, push files, enable Pages, create PRs.
+    """
+    BASE = "https://api.github.com"
 
-def ensure_preview_server(vfs: VirtualFS):
-    if st.session_state.get("preview_server_started"):
-        return
-    root = vfs.root
+    def __init__(self, token: str):
+        self.token = token
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+        }
 
-    class Handler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=root, **kwargs)
-        def log_message(self, *args):
+    def _get(self, path: str) -> dict:
+        r = requests.get(f"{self.BASE}{path}", headers=self.headers, timeout=20)
+        r.raise_for_status()
+        return r.json()
+
+    def _post(self, path: str, body: dict) -> dict:
+        r = requests.post(f"{self.BASE}{path}", headers=self.headers,
+                          json=body, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def _put(self, path: str, body: dict) -> dict:
+        r = requests.put(f"{self.BASE}{path}", headers=self.headers,
+                         json=body, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def _patch(self, path: str, body: dict) -> dict:
+        r = requests.patch(f"{self.BASE}{path}", headers=self.headers,
+                           json=body, timeout=20)
+        r.raise_for_status()
+        return r.json()
+
+    def whoami(self) -> str:
+        return self._get("/user")["login"]
+
+    def repo_exists(self, owner: str, repo: str) -> bool:
+        try:
+            self._get(f"/repos/{owner}/{repo}")
+            return True
+        except Exception:
+            return False
+
+    def create_repo(self, name: str, private: bool = False, description: str = "") -> dict:
+        return self._post("/user/repos", {
+            "name": name,
+            "description": description or f"Built with Forge AI ⚡",
+            "private": private,
+            "auto_init": False,
+        })
+
+    def get_default_branch(self, owner: str, repo: str) -> str:
+        data = self._get(f"/repos/{owner}/{repo}")
+        return data.get("default_branch", "main")
+
+    def get_branch_sha(self, owner: str, repo: str, branch: str) -> str | None:
+        try:
+            data = self._get(f"/repos/{owner}/{repo}/git/refs/heads/{branch}")
+            return data["object"]["sha"]
+        except Exception:
+            return None
+
+    def get_file_sha(self, owner: str, repo: str, path: str, branch: str) -> str | None:
+        try:
+            data = self._get(f"/repos/{owner}/{repo}/contents/{path}?ref={branch}")
+            return data.get("sha")
+        except Exception:
+            return None
+
+    def upsert_file(self, owner: str, repo: str, path: str,
+                    content: str, branch: str, message: str) -> dict:
+        b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        body = {"message": message, "content": b64, "branch": branch}
+        existing_sha = self.get_file_sha(owner, repo, path, branch)
+        if existing_sha:
+            body["sha"] = existing_sha
+        return self._put(f"/repos/{owner}/{repo}/contents/{path}", body)
+
+    def create_branch(self, owner: str, repo: str, branch: str, from_sha: str):
+        try:
+            self._post(f"/repos/{owner}/{repo}/git/refs", {
+                "ref": f"refs/heads/{branch}",
+                "sha": from_sha,
+            })
+        except Exception:
+            pass  # branch may already exist
+
+    def init_repo_with_readme(self, owner: str, repo: str, branch: str = "main"):
+        """Create an initial commit so the repo has a HEAD."""
+        readme = f"# {repo}\n\nBuilt with [Forge AI](https://forge.ai) ⚡\n"
+        self.upsert_file(owner, repo, "README.md", readme, branch, "Initial commit")
+
+    def enable_pages(self, owner: str, repo: str, branch: str = "main") -> str | None:
+        """Enable GitHub Pages on the given branch root. Returns the Pages URL."""
+        try:
+            r = requests.post(
+                f"{self.BASE}/repos/{owner}/{repo}/pages",
+                headers=self.headers,
+                json={"source": {"branch": branch, "path": "/"}},
+                timeout=20,
+            )
+            if r.status_code in (201, 409):
+                # 409 = already enabled; fetch existing config
+                info = requests.get(
+                    f"{self.BASE}/repos/{owner}/{repo}/pages",
+                    headers=self.headers, timeout=10,
+                )
+                if info.ok:
+                    return info.json().get("html_url")
+        except Exception:
+            pass
+        return None
+
+    def create_pr(self, owner: str, repo: str, head: str, base: str, title: str, body: str) -> str:
+        data = self._post(f"/repos/{owner}/{repo}/pulls", {
+            "title": title, "body": body, "head": head, "base": base,
+        })
+        return data.get("html_url", "")
+
+    def push_files(
+        self,
+        owner: str,
+        repo: str,
+        files: dict[str, str],
+        branch: str = "main",
+        commit_msg: str = "⚡ Forge AI — update",
+        create_pr_to: str | None = None,
+        enable_pages: bool = False,
+        log_fn=None,
+    ) -> dict:
+        """
+        Diff-aware multi-file push via GitHub Contents API.
+        Returns {"branch": str, "pages_url": str | None, "pr_url": str | None,
+                 "repo_url": str, "changed": int, "skipped": int}
+        """
+        def log(msg):
+            if log_fn:
+                log_fn(msg)
+
+        log(f"🔍 Checking repo {owner}/{repo}…")
+
+        # Ensure repo exists
+        if not self.repo_exists(owner, repo):
+            log(f"📦 Creating repo {repo}…")
+            self.create_repo(repo)
+
+        # Get or create default branch
+        default_branch = "main"
+        try:
+            default_branch = self.get_default_branch(owner, repo)
+        except Exception:
             pass
 
-    with _server_lock:
-        if not st.session_state.get("preview_server_started"):
+        base_sha = self.get_branch_sha(owner, repo, default_branch)
+
+        # If repo is empty, push README first to create HEAD
+        if base_sha is None:
+            log("📄 Initialising repository…")
+            self.init_repo_with_readme(owner, repo, default_branch)
+            base_sha = self.get_branch_sha(owner, repo, default_branch)
+
+        # Determine target branch
+        target_branch = branch if branch != default_branch else default_branch
+        if target_branch != default_branch:
+            log(f"🌿 Creating branch `{target_branch}`…")
+            self.create_branch(owner, repo, target_branch, base_sha)
+
+        # Diff-aware push: only upload changed files
+        changed = 0
+        skipped = 0
+        for path, content in files.items():
+            # Compute remote SHA to detect changes
+            remote_sha = self.get_file_sha(owner, repo, path, target_branch)
+            local_sha = hashlib.sha1(
+                f"blob {len(content.encode())}\0{content}".encode()
+            ).hexdigest()
+
+            if remote_sha and remote_sha == local_sha:
+                skipped += 1
+                continue
+
+            log(f"{'✏️ Updating' if remote_sha else '➕ Creating'}  {path}…")
             try:
-                httpd = socketserver.TCPServer(("", PREVIEW_PORT), Handler)
-                httpd.allow_reuse_address = True
-                threading.Thread(target=httpd.serve_forever, daemon=True).start()
-                st.session_state["preview_server_started"] = True
-                st.session_state["preview_httpd"] = httpd
-            except OSError:
-                st.session_state["preview_server_started"] = True
+                self.upsert_file(owner, repo, path, content, target_branch,
+                                 f"{commit_msg}\n\nUpdated {path}")
+                changed += 1
+            except Exception as e:
+                log(f"⚠️  Skipped {path}: {e}")
+
+        pages_url = None
+        if enable_pages:
+            log("🌐 Enabling GitHub Pages…")
+            pages_url = self.enable_pages(owner, repo, target_branch)
+            if pages_url:
+                log(f"✅ Pages live at {pages_url}")
+
+        pr_url = None
+        if create_pr_to and target_branch != create_pr_to and changed > 0:
+            log(f"📬 Opening PR → `{create_pr_to}`…")
+            pr_url = self.create_pr(
+                owner, repo, target_branch, create_pr_to,
+                title=f"⚡ Forge AI — {commit_msg}",
+                body="Automated update from [Forge AI](https://forge.ai). Review and merge when ready.",
+            )
+            if pr_url:
+                log(f"✅ PR: {pr_url}")
+
+        return {
+            "branch": target_branch,
+            "pages_url": pages_url,
+            "pr_url": pr_url,
+            "repo_url": f"https://github.com/{owner}/{repo}",
+            "changed": changed,
+            "skipped": skipped,
+        }
 
 
 # ─────────────────────────────────────────────
@@ -296,13 +482,14 @@ class AIClient:
 
 
 # ─────────────────────────────────────────────
-# AGENT PROMPTS
+# AGENT PROMPTS  —  Lovable-class
 # ─────────────────────────────────────────────
-AGENT_SYSTEM_PROMPT = """IMPORTANT: You are Forge, an elite autonomous web app builder and UI engineer. You output ONLY raw JSON — no prose, no markdown, no explanations.
+AGENT_SYSTEM_PROMPT = """IMPORTANT: You are Forge, an elite autonomous web application engineer operating at Lovable/v0/Cursor level. You build production-quality, shippable apps — not prototypes. You output ONLY raw JSON — no prose, no markdown, no explanations outside the JSON fields.
 
-OUTPUT FORMAT — return this exact JSON shape and nothing else:
+OUTPUT FORMAT — return this exact JSON shape and NOTHING ELSE:
 {
-  "summary": "one-line description of what you built or changed",
+  "summary": "one-line description of what was built or changed",
+  "tech_stack": ["html", "css", "js"],
   "actions": [
     { "type": "create", "path": "index.html", "content": "..." },
     { "type": "edit",   "path": "style.css",  "content": "..." },
@@ -310,39 +497,130 @@ OUTPUT FORMAT — return this exact JSON shape and nothing else:
   ]
 }
 
-CORE RULES:
-- "create" = new file, "edit" = full replacement, "delete" = remove file.
-- PRESERVATION: You receive COMPLETE current file contents. Copy ALL existing content, then apply only the requested change. NEVER remove features, functions, styles, or text unless explicitly asked.
-- Only include files that actually change. Unchanged files: omit entirely.
-- Build production-quality, visually stunning, fully functional apps.
-- Prefer vanilla HTML/CSS/JS + Tailwind CDN + Google Fonts for portability.
-- Apps must be fully interactive and functional end-to-end.
-- Return JSON only. No prose. No markdown. No web searches.
+═══════════════════════════════════════════
+ENGINEERING STANDARDS (NON-NEGOTIABLE)
+═══════════════════════════════════════════
 
-WHEN GIVEN A SCRAPED PAGE CONTEXT:
-- You are being asked to CLONE and UPGRADE the provided page.
-- Study its layout, color palette, typography, spacing, component structure, and interaction patterns.
-- Reproduce the LOOK AND FEEL faithfully, then upgrade with:
-  • Better animations and micro-interactions
-  • Cleaner, more modern code (no legacy hacks, no jQuery unless needed)
-  • Mobile responsiveness if missing
-  • Accessibility improvements (aria labels, keyboard nav, focus styles)
-  • Any additional features the user explicitly requested
-- Extract components intelligently: nav, hero, cards, footer → separate logical sections in code.
-- Do NOT hotlink images from the scraped domain — use https://picsum.photos/{width}/{height} as placeholders.
-- Strip tracking scripts, cookie banners, ads, and third-party analytics entirely.
-- Always produce a self-contained result with NO external dependencies except CDN links.
+1. ARCHITECTURE
+   ─ Split every app: index.html + style.css + app.js (+ additional modules as needed)
+   ─ Use ES modules (type="module") and import/export for all JS
+   ─ Organise JS with clear layers: state management → business logic → UI rendering → event wiring
+   ─ Singleton pattern for app state; pure functions for transformations
+   ─ One-pagers only when explicitly trivial (landing page, static card, etc.)
 
-MULTI-FILE STRATEGY:
-- Complex apps: split into index.html + style.css + app.js
-- Simple one-pagers: keep everything in index.html
-- Always ensure index.html is the entry point.
+2. CODE QUALITY
+   ─ Write typed JSDoc on every exported function (param + return types)
+   ─ Explicit error handling: try/catch, user-visible error states, never silent failures
+   ─ Input validation on all user-facing forms (HTML5 + JS double-validation)
+   ─ Never use innerHTML with user-supplied strings — use textContent or DOM APIs
+   ─ Idempotent operations: running the same action twice should be safe
+   ─ Guard all async operations: loading state → success/error → reset
 
-AI-POWERED APP PATTERN (when building AI chat features):
-  POST https://raujzsawwpmixwlcgcgs.supabase.co/functions/v1/public-ai-api
-  Headers: { "Authorization": "Bearer FORGE_AI_KEY_PLACEHOLDER", "Content-Type": "application/json" }
-  Body messages: [systemTurn, assistantAck, ...history, userTurn]
-  Always use FORGE_AI_KEY_PLACEHOLDER as the Bearer token — it is injected at runtime."""
+3. UI / UX EXCELLENCE
+   ─ Every app must feel COMPLETE: empty states, loading skeletons, error messages, success feedback
+   ─ Responsive by default: mobile-first CSS with sensible breakpoints (480 / 768 / 1200px)
+   ─ Keyboard navigable: tab order, focus styles, Enter/Space on interactive elements
+   ─ ARIA roles on custom components (role="dialog", aria-label, aria-live for dynamic regions)
+   ─ Colour contrast ≥ 4.5:1 for body text, ≥ 3:1 for large/UI text
+   ─ Touch targets ≥ 44×44px
+   ─ Smooth transitions (150–300ms ease) on interactive elements
+   ─ Prefer CSS animations over JS for micro-interactions
+
+4. VISUAL DESIGN
+   ─ Design tokens via CSS custom properties on :root (never hardcode values inline)
+   ─ Typography: pair a strong display font (Google Fonts) with a legible body font
+   ─ Spacing scale: 4px base unit (4, 8, 12, 16, 24, 32, 48, 64, 96)
+   ─ Tailwind CDN is allowed but optional; raw CSS is fine and often cleaner
+   ─ Use CSS Grid for layout, Flexbox for alignment — not tables, not floats
+   ─ Dark mode support via prefers-color-scheme media query at minimum
+   ─ No placeholder lorem ipsum — write realistic copy that fits the domain
+
+5. PERFORMANCE
+   ─ Lazy-load heavy resources (images, large JS)
+   ─ Debounce search/filter inputs (300ms)
+   ─ requestAnimationFrame for canvas/scroll animations
+   ─ Prefer CDN links from cdnjs.cloudflare.com, unpkg.com, or esm.sh
+   ─ Keep total payload under 500 KB for simple apps
+
+6. PRESERVATION RULE
+   ─ You receive COMPLETE current file contents. Copy ALL existing content, then apply only the requested change.
+   ─ NEVER remove features, functions, styles, or data unless explicitly asked.
+   ─ Only include files that actually change — omit unchanged files.
+
+═══════════════════════════════════════════
+COMPONENT PATTERNS
+═══════════════════════════════════════════
+
+MODAL:
+<div class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal">
+    <h2 id="modal-title">…</h2>
+    <button class="modal-close" aria-label="Close">×</button>
+  </div>
+</div>
+// JS: trap focus, Escape to close, lock body scroll
+
+TOAST NOTIFICATIONS:
+const toast = (msg, type='info') => { /* create, animate in, auto-dismiss 3s, remove */ }
+
+FORM WITH VALIDATION:
+// HTML5 required/pattern + JS constraint validation API
+// Show inline errors next to each field, not just an alert
+// Disable submit during async operation, restore on completion
+
+DATA TABLE:
+// Sort by column (ascending/descending toggle), client-side filter, pagination
+// Empty state message, loading skeleton rows
+
+DRAG AND DROP:
+// HTML5 DnD API or Pointer Events — NOT SortableJS unless explicitly requested
+// Visual feedback: drag ghost, drop zone highlight, drop animation
+
+INFINITE SCROLL / PAGINATION:
+// IntersectionObserver for infinite scroll; explicit page controls for pagination
+
+═══════════════════════════════════════════
+TECH CHOICES
+═══════════════════════════════════════════
+
+DEFAULT STACK (no framework):
+- index.html with semantic HTML5
+- style.css with CSS custom properties
+- app.js as ES module entry point
+- Additional .js modules for complex logic
+
+WHEN TO USE LIBRARIES (CDN only, no build step):
+- Charts       → Chart.js (cdnjs)
+- Rich text    → Quill (cdnjs)
+- Date picking → Flatpickr (cdnjs)
+- Markdown     → marked.js (cdnjs)
+- Syntax HL    → Prism.js (cdnjs)
+- Icons        → Lucide (esm.sh) or Heroicons (SVG inline)
+- 3D/Canvas    → Three.js (cdnjs) only when explicitly needed
+
+NEVER USE (without explicit request):
+- jQuery, Bootstrap, React, Vue, Angular, Svelte
+- Any NPM package that requires a build step
+
+═══════════════════════════════════════════
+CLONE MODE (when scrape context is provided)
+═══════════════════════════════════════════
+- Faithfully reproduce layout, palette, typography, spacing, component hierarchy
+- Upgrade: animations, responsiveness, accessibility, code cleanliness
+- Use https://picsum.photos/{w}/{h} for image placeholders
+- Strip: tracking pixels, cookie banners, ads, analytics, jQuery (rewrite in vanilla)
+- Produce a fully self-contained build with zero external image dependencies
+
+═══════════════════════════════════════════
+AI-POWERED APP PATTERN
+═══════════════════════════════════════════
+Endpoint: POST https://raujzsawwpmixwlcgcgs.supabase.co/functions/v1/public-ai-api
+Headers: { "Authorization": "Bearer FORGE_AI_KEY_PLACEHOLDER", "Content-Type": "application/json" }
+Body: { "messages": [ ...conversationHistory ] }
+Always use FORGE_AI_KEY_PLACEHOLDER — injected at runtime.
+
+Return ONLY the JSON object. No prose. No markdown fences. No explanations outside JSON.
+"""
 
 CHAT_SYSTEM_PROMPT = """You are Forge AI, a friendly expert assistant built into a web app builder called Forge.
 Your personality: sharp, concise, genuinely helpful — like a senior engineer on your team.
@@ -426,24 +704,17 @@ def run_agent(
 
 
 # ─────────────────────────────────────────────
-# PUBLISH  (multi-strategy, always succeeds)
+# PUBLISH  (multi-strategy)
 # ─────────────────────────────────────────────
 def publish_app(vfs: VirtualFS) -> dict:
-    """
-    Strategy 1: Netlify anonymous deploy (application/zip POST)
-    Strategy 2: Netlify anonymous deploy (multipart form)
-    Strategy 3: data: URI fallback — always works, no external service needed
-    Returns {"url": str, "method": str, "html"?: str}
-    """
     zip_bytes = vfs.to_zip_bytes()
 
-    # ── Strategy 1: Netlify raw zip POST ──────────────
+    # Strategy 1: Netlify raw zip POST
     try:
         resp = requests.post(
             "https://api.netlify.com/api/v1/sites",
             headers={"Content-Type": "application/zip"},
-            data=zip_bytes,
-            timeout=60,
+            data=zip_bytes, timeout=60,
         )
         if resp.status_code in (200, 201):
             data = resp.json()
@@ -452,7 +723,7 @@ def publish_app(vfs: VirtualFS) -> dict:
     except Exception:
         pass
 
-    # ── Strategy 2: Netlify multipart ─────────────────
+    # Strategy 2: Netlify multipart
     try:
         resp = requests.post(
             "https://api.netlify.com/api/v1/sites",
@@ -466,44 +737,11 @@ def publish_app(vfs: VirtualFS) -> dict:
     except Exception:
         pass
 
-    # ── Strategy 3: data: URI (always works) ──────────
+    # Strategy 3: data: URI (always works)
     single_html = vfs.to_single_html()
     b64 = base64.b64encode(single_html.encode("utf-8")).decode("ascii")
     data_uri = f"data:text/html;base64,{b64}"
     return {"url": data_uri, "method": "data-uri", "html": single_html}
-
-
-# ─────────────────────────────────────────────
-# GITHUB SYNC  (optional)
-# ─────────────────────────────────────────────
-def push_to_github(vfs: VirtualFS, token: str, repo_name: str) -> str:
-    from git import Repo as GitRepo
-    import shutil
-
-    tmp = tempfile.mkdtemp(prefix="forge_gh_")
-    clone_url = f"https://{token}@github.com/{repo_name}.git"
-    git_repo = GitRepo.clone_from(clone_url, tmp)
-
-    branch = "forge-ai"
-    try:
-        git_repo.git.checkout("-b", branch)
-    except Exception:
-        git_repo.git.checkout(branch)
-
-    for path, content in vfs.files.items():
-        dest = Path(tmp) / path
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content, encoding="utf-8")
-
-    git_repo.git.add(all=True)
-    if git_repo.is_dirty(untracked_files=True):
-        git_repo.index.commit("⚡ Forge AI — automated update")
-        origin = git_repo.remote("origin")
-        origin.set_url(clone_url)
-        origin.push(refspec=f"{branch}:{branch}")
-
-    shutil.rmtree(tmp, ignore_errors=True)
-    return branch
 
 
 # ─────────────────────────────────────────────
@@ -574,6 +812,21 @@ code, pre, .stCode { font-family: 'IBM Plex Mono', monospace !important; font-si
     border-radius: 4px; padding: 3px 8px; font-family: 'IBM Plex Mono', monospace;
     font-size: 11px; color: #a78bfa; margin-bottom: 6px;
 }
+.gh-card {
+    background: #12121c; border: 1px solid #2a2a3e; border-radius: 10px;
+    padding: 16px 20px; margin: 8px 0;
+    font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+}
+.gh-badge {
+    display: inline-block; background: #1a2a1a; border: 1px solid #2ea043;
+    border-radius: 4px; padding: 3px 8px; font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px; color: #56d364; margin: 2px 3px;
+}
+.gh-badge-purple {
+    display: inline-block; background: #1a1a2e; border: 1px solid #7c6af7;
+    border-radius: 4px; padding: 3px 8px; font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px; color: #a78bfa; margin: 2px 3px;
+}
 hr { border-color: #1e1e2e !important; }
 .stCaption { color: #606080 !important; }
 </style>
@@ -601,6 +854,11 @@ def _make_project(name: str = "untitled") -> tuple[str, dict]:
         "published_url": None,
         "published_method": None,
         "scrape_cache": {},
+        # GitHub state
+        "github_repo": "",
+        "github_branch": "main",
+        "github_pages_url": None,
+        "github_last_push": None,
     }
 
 
@@ -618,29 +876,31 @@ def init_state():
             pdata["vfs_root"] = tempfile.mkdtemp(prefix=f"forge_{pid}_")
         pdata.setdefault("scrape_cache", {})
         pdata.setdefault("published_method", None)
+        pdata.setdefault("github_repo", "")
+        pdata.setdefault("github_branch", "main")
+        pdata.setdefault("github_pages_url", None)
+        pdata.setdefault("github_last_push", None)
 
     st.session_state.setdefault("selected_file", None)
     st.session_state.setdefault("last_scrape_url", "")
-
-
-def save_project():
-    pass  # all writes go directly to active_proj()
+    st.session_state.setdefault("github_token", "")
+    st.session_state.setdefault("gh_log", [])
 
 
 def new_project():
-    save_project()
     pid, pdata = _make_project()
     st.session_state["projects"][pid] = pdata
     st.session_state["active_project"] = pid
     st.session_state["selected_file"] = None
     st.session_state["last_scrape_url"] = ""
+    st.session_state["gh_log"] = []
 
 
 def switch_project(pid: str):
-    save_project()
     st.session_state["active_project"] = pid
     st.session_state["selected_file"] = None
     st.session_state["last_scrape_url"] = ""
+    st.session_state["gh_log"] = []
 
 
 init_state()
@@ -687,6 +947,13 @@ with st.sidebar:
                 f'font-size:10px;color:#7c6af7;text-decoration:none;">🌐 {pub.replace("https://","")}</a>',
                 unsafe_allow_html=True,
             )
+        gh_pages = pdata.get("github_pages_url")
+        if gh_pages:
+            st.markdown(
+                f'<a href="{gh_pages}" target="_blank" style="font-family:IBM Plex Mono,monospace;'
+                f'font-size:10px;color:#56d364;text-decoration:none;">🐙 {gh_pages.replace("https://","")}</a>',
+                unsafe_allow_html=True,
+            )
 
     st.divider()
 
@@ -727,39 +994,23 @@ with st.sidebar:
         active_proj()["published_url"] = None
         active_proj()["published_method"] = None
         active_proj()["scrape_cache"] = {}
+        active_proj()["github_pages_url"] = None
+        active_proj()["github_last_push"] = None
         st.session_state["selected_file"] = None
         st.session_state["last_scrape_url"] = ""
+        st.session_state["gh_log"] = []
         st.rerun()
-
-    st.divider()
-
-    with st.expander("☁️ GitHub Sync (optional)"):
-        github_token = st.text_input("GitHub Token", type="password", key="gh_token")
-        github_repo  = st.text_input("Repo (owner/name)", key="gh_repo", placeholder="you/my-repo")
-        if st.button("Push to GitHub", use_container_width=True):
-            if not github_token or not github_repo:
-                st.error("Token and repo required.")
-            elif not vfs.list_files():
-                st.error("Nothing to push — build first.")
-            else:
-                with st.spinner("Pushing…"):
-                    try:
-                        branch = push_to_github(vfs, github_token, github_repo)
-                        st.success(f"Pushed → branch `{branch}`")
-                    except Exception as e:
-                        st.error(f"Push failed: {e}")
 
 
 # ─────────────────────────────────────────────
 # MAIN AREA
 # ─────────────────────────────────────────────
-main_tabs = st.tabs(["🏗 Build", "👁 Preview", "📂 Editor", "📜 History"])
+main_tabs = st.tabs(["🏗 Build", "👁 Preview", "📂 Editor", "🐙 GitHub", "📜 History"])
 
 
 # ──────────── TAB 1 : BUILD + CHAT ─────────────────
 with main_tabs[0]:
 
-    # ── Chat history ─────────────────────────────────
     with st.container():
         if not active_proj()["chat_history"]:
             st.markdown(
@@ -788,7 +1039,6 @@ with main_tabs[0]:
 
     st.divider()
 
-    # ── URL input ─────────────────────────────────────
     url_col, clear_col = st.columns([9, 1])
     with url_col:
         scrape_url_val = st.text_input(
@@ -810,26 +1060,21 @@ with main_tabs[0]:
             unsafe_allow_html=True,
         )
 
-    # ── Prompt + controls ─────────────────────────────
     col1, col2, col3 = st.columns([6, 2, 2])
     with col1:
         prompt = st.text_area(
-            "Message",
-            height=80,
+            "Message", height=80,
             placeholder="Clone this site with dark mode… or Build a kanban board with drag-and-drop…",
-            key="prompt_input",
-            label_visibility="collapsed",
+            key="prompt_input", label_visibility="collapsed",
         )
     with col2:
         build_clicked = st.button("⚡ Build", type="primary", use_container_width=True)
     with col3:
         mode = st.radio(
-            "Mode", ["✨ New", "✏️ Edit"],
-            horizontal=False,
+            "Mode", ["✨ New", "✏️ Edit"], horizontal=False,
             index=0 if not vfs.list_files() else 1,
         )
 
-    # ── Intent detection ─────────────────────────────
     BUILD_VERBS = [
         "build", "create", "make", "add", "generate", "write", "update",
         "change", "fix", "edit", "remove", "delete", "refactor", "style",
@@ -842,7 +1087,6 @@ with main_tabs[0]:
         t = text.lower()
         return any(v in t for v in BUILD_VERBS)
 
-    # ── RUN ──────────────────────────────────────────
     if build_clicked:
         if not AI_KEY:
             st.error("⚠️  Set the `COMPLEX_AI_KEY` environment variable to use Forge AI.")
@@ -858,7 +1102,6 @@ with main_tabs[0]:
 
             if is_build_intent(user_text) or url_provided or "✨ New" in mode:
 
-                # ── Scrape if URL provided ─────────────
                 scrape_context = None
                 if url_provided:
                     cache_key = scrape_url_val.strip()
@@ -879,7 +1122,6 @@ with main_tabs[0]:
                     active_proj()["build_log"].append(scrape_info)
                     st.session_state["last_scrape_url"] = scrape_url_val.strip()
 
-                # ── Build ──────────────────────────────
                 existing = (
                     dict(vfs.files)
                     if "✏️ Edit" in mode and vfs.list_files()
@@ -904,11 +1146,14 @@ with main_tabs[0]:
 
                 summary = result.get("summary", "Done.")
                 actions = result.get("actions", [])
+                tech_stack = result.get("tech_stack", [])
 
                 log_lines = [f"✅ {summary}", ""]
                 for a in actions:
                     icon = {"create": "➕", "edit": "✏️", "delete": "🗑"}.get(a.get("type"), "•")
                     log_lines.append(f"{icon}  {a.get('path','?')}")
+                if tech_stack:
+                    log_lines.append(f"\n🔧 Stack: {', '.join(tech_stack)}")
                 active_proj()["build_log"].extend(log_lines)
                 active_proj()["history"].append({"role": "user",  "text": user_text})
                 active_proj()["history"].append({"role": "agent", "text": summary})
@@ -917,13 +1162,42 @@ with main_tabs[0]:
                 if html:
                     active_proj()["last_preview_html"] = vfs.inject_css_js(html)
 
-                save_project()
-                active_proj()["chat_history"].append(
-                    {"role": "assistant", "content": f"✅ {summary} — switch to Preview tab to see it!"}
-                )
+                # Auto-push to GitHub if configured
+                gh_token = st.session_state.get("github_token", "")
+                gh_repo  = active_proj().get("github_repo", "")
+                if gh_token and gh_repo and vfs.list_files():
+                    try:
+                        gh = GitHubClient(gh_token)
+                        owner = gh.whoami()
+                        repo_name = gh_repo.split("/")[-1] if "/" in gh_repo else gh_repo
+                        branch = active_proj().get("github_branch", "main")
+
+                        push_result = gh.push_files(
+                            owner, repo_name, dict(vfs.files),
+                            branch=branch,
+                            commit_msg=f"⚡ {summary}",
+                            enable_pages=True,
+                        )
+
+                        if push_result.get("pages_url"):
+                            active_proj()["github_pages_url"] = push_result["pages_url"]
+
+                        active_proj()["github_last_push"] = push_result
+                        active_proj()["build_log"].append(
+                            f"🐙 Auto-synced to GitHub ({push_result['changed']} files changed)"
+                        )
+                    except Exception as e:
+                        active_proj()["build_log"].append(f"⚠️ GitHub sync skipped: {e}")
+
+                reply = f"✅ {summary}"
+                if vfs.list_files():
+                    reply += " — switch to **Preview** to see it!"
+                if active_proj().get("github_pages_url"):
+                    reply += f" Also live on [GitHub Pages]({active_proj()['github_pages_url']})."
+
+                active_proj()["chat_history"].append({"role": "assistant", "content": reply})
 
             else:
-                # ── Chat path ──────────────────────────
                 conversation = [
                     {"role": m["role"], "content": m["content"]}
                     for m in active_proj()["chat_history"]
@@ -937,12 +1211,11 @@ with main_tabs[0]:
 
             st.rerun()
 
-    # ── Build log ─────────────────────────────────────
     if active_proj()["build_log"]:
         with st.expander("Build Log", expanded=False):
             st.markdown(
                 '<div class="build-log">'
-                + "<br>".join(f"› {l}" for l in active_proj()["build_log"][-60:])
+                + "<br>".join(f"› {l}" for l in active_proj()["build_log"][-80:])
                 + "</div>",
                 unsafe_allow_html=True,
             )
@@ -958,13 +1231,13 @@ with main_tabs[1]:
         proj       = active_proj()
         pub_url    = proj.get("published_url")
         pub_method = proj.get("published_method", "")
+        pages_url  = proj.get("github_pages_url")
 
-        # ── Top bar ──────────────────────────────────
         col_pub, col_dl, col_zip, col_info = st.columns([2, 2, 2, 4])
 
         with col_pub:
             if st.button("🌐 Publish", type="primary", use_container_width=True,
-                         help="Deploy — uses Netlify if available, falls back to a portable data URI"):
+                         help="Deploy via Netlify or fallback to data: URI"):
                 if not vfs.list_files():
                     st.error("Nothing to publish.")
                 else:
@@ -973,11 +1246,10 @@ with main_tabs[1]:
                             result_pub = publish_app(vfs)
                             proj["published_url"]    = result_pub["url"]
                             proj["published_method"] = result_pub["method"]
-                            save_project()
                             if result_pub["method"] == "data-uri":
                                 st.warning(
-                                    "Netlify unavailable — your app is packaged as a portable link. "
-                                    "Click **Open App** on the right to launch it, or use **Download ZIP** to self-host."
+                                    "Netlify unavailable — app packaged as a portable link. "
+                                    "Use **Open App** or **Download ZIP** to self-host."
                                 )
                             else:
                                 st.success(f"Live at [{result_pub['url']}]({result_pub['url']})")
@@ -987,43 +1259,42 @@ with main_tabs[1]:
 
         with col_dl:
             st.download_button(
-                "⬇️ HTML",
-                data=preview_html,
-                file_name="index.html",
-                mime="text/html",
-                use_container_width=True,
+                "⬇️ HTML", data=preview_html, file_name="index.html",
+                mime="text/html", use_container_width=True,
             )
 
         with col_zip:
             if vfs.list_files():
                 st.download_button(
-                    "📦 ZIP",
-                    data=vfs.to_zip_bytes(),
-                    file_name="forge-project.zip",
-                    mime="application/zip",
+                    "📦 ZIP", data=vfs.to_zip_bytes(),
+                    file_name="forge-project.zip", mime="application/zip",
                     use_container_width=True,
-                    help="All project files as a ZIP — host anywhere",
                 )
 
         with col_info:
+            links = []
             if pub_url:
                 if pub_method == "data-uri":
-                    st.markdown(
+                    links.append(
                         f'<a href="{pub_url}" target="_blank" '
                         f'style="display:inline-block;background:linear-gradient(135deg,#7c6af7,#a78bfa);'
                         f'color:#fff;text-decoration:none;border-radius:6px;padding:6px 14px;'
-                        f'font-family:Syne,sans-serif;font-weight:700;font-size:13px;">🚀 Open App</a>',
-                        unsafe_allow_html=True,
+                        f'font-family:Syne,sans-serif;font-weight:700;font-size:13px;">🚀 Open App</a>'
                     )
                 else:
-                    st.markdown(
-                        f'🌐 <a href="{pub_url}" target="_blank" style="color:#a78bfa;">{pub_url}</a>',
-                        unsafe_allow_html=True,
+                    links.append(
+                        f'🌐 <a href="{pub_url}" target="_blank" style="color:#a78bfa;">'
+                        f'{pub_url.replace("https://","")}</a>'
                     )
+            if pages_url:
+                links.append(
+                    f'🐙 <a href="{pages_url}" target="_blank" style="color:#56d364;">'
+                    f'GitHub Pages</a>'
+                )
+            if links:
+                st.markdown(" &nbsp; ".join(links), unsafe_allow_html=True)
 
         st.divider()
-
-        # ── Preview iframe ────────────────────────────
         st.components.v1.html(preview_html, height=700, scrolling=True)
 
 
@@ -1034,8 +1305,7 @@ with main_tabs[2]:
         st.info("No files yet.")
     else:
         selected = st.selectbox(
-            "File",
-            files,
+            "File", files,
             index=(
                 files.index(st.session_state["selected_file"])
                 if st.session_state["selected_file"] in files else 0
@@ -1045,12 +1315,9 @@ with main_tabs[2]:
         st.session_state["selected_file"] = selected
 
         content = vfs.read(selected) or ""
-
         edited = st.text_area(
-            f"Editing: `{selected}`",
-            value=content,
-            height=500,
-            key=f"editor_{selected}",
+            f"Editing: `{selected}`", value=content,
+            height=500, key=f"editor_{selected}",
         )
 
         col_save, col_revert = st.columns(2)
@@ -1075,8 +1342,219 @@ with main_tabs[2]:
             st.rerun()
 
 
-# ──────────── TAB 4 : HISTORY ───────────────
+# ──────────── TAB 4 : GITHUB ────────────────
 with main_tabs[3]:
+    st.markdown("### 🐙 GitHub Sync")
+    st.caption("Push your project to GitHub and host it for free with GitHub Pages.")
+
+    # ── Token input ──────────────────────────
+    gh_token = st.text_input(
+        "GitHub Personal Access Token",
+        type="password",
+        value=st.session_state.get("github_token", ""),
+        placeholder="ghp_xxxxxxxxxxxxxxxxxxxx",
+        help="Create at github.com → Settings → Developer settings → Personal access tokens → Fine-grained. Needs: repo (read/write), pages (write).",
+        key="gh_token_input",
+    )
+    if gh_token != st.session_state.get("github_token", ""):
+        st.session_state["github_token"] = gh_token
+
+    # Show logged-in user
+    if gh_token:
+        try:
+            _gh = GitHubClient(gh_token)
+            gh_user = _gh.whoami()
+            st.markdown(
+                f'<span class="gh-badge">✓ Authenticated as @{gh_user}</span>',
+                unsafe_allow_html=True,
+            )
+        except Exception:
+            st.markdown(
+                '<span style="color:#f87171;font-family:IBM Plex Mono,monospace;font-size:12px;">'
+                '✗ Invalid token or no network access</span>',
+                unsafe_allow_html=True,
+            )
+            gh_user = None
+    else:
+        gh_user = None
+
+    st.divider()
+
+    # ── Repo config ──────────────────────────
+    col_r, col_b = st.columns([3, 2])
+    with col_r:
+        gh_repo_input = st.text_input(
+            "Repository name",
+            value=active_proj().get("github_repo", ""),
+            placeholder="my-forge-app",
+            help="Just the repo name — we'll create it under your account if it doesn't exist.",
+        )
+        if gh_repo_input != active_proj().get("github_repo", ""):
+            active_proj()["github_repo"] = gh_repo_input
+
+    with col_b:
+        gh_branch_input = st.text_input(
+            "Branch",
+            value=active_proj().get("github_branch", "main"),
+            placeholder="main",
+        )
+        if gh_branch_input != active_proj().get("github_branch", "main"):
+            active_proj()["github_branch"] = gh_branch_input
+
+    col_priv, col_pages = st.columns(2)
+    with col_priv:
+        gh_private = st.checkbox("Private repository", value=False)
+    with col_pages:
+        gh_enable_pages = st.checkbox("Enable GitHub Pages", value=True,
+                                      help="Auto-deploys your app to a free github.io URL")
+
+    col_pr, col_commit = st.columns(2)
+    with col_pr:
+        gh_create_pr = st.checkbox(
+            "Open Pull Request",
+            value=False,
+            help="Push to a feature branch and open a PR to main instead of pushing directly",
+        )
+    with col_commit:
+        gh_commit_msg = st.text_input(
+            "Commit message",
+            value="⚡ Forge AI — update",
+            placeholder="⚡ Forge AI — update",
+        )
+
+    st.divider()
+
+    # ── Push button ──────────────────────────
+    push_col, status_col = st.columns([2, 5])
+    with push_col:
+        push_clicked = st.button(
+            "🚀 Push to GitHub", type="primary",
+            use_container_width=True,
+            disabled=not (gh_token and gh_repo_input and vfs.list_files()),
+        )
+
+    if not gh_token:
+        st.caption("↑ Enter your GitHub token to enable push.")
+    elif not gh_repo_input:
+        st.caption("↑ Enter a repository name.")
+    elif not vfs.list_files():
+        st.caption("↑ Build something first.")
+
+    if push_clicked and gh_token and gh_repo_input and vfs.list_files():
+        gh_log_lines: list[str] = []
+
+        def gh_log(msg: str):
+            gh_log_lines.append(msg)
+
+        progress_placeholder = st.empty()
+
+        with st.spinner("Syncing with GitHub…"):
+            try:
+                gh = GitHubClient(gh_token)
+                owner = gh.whoami()
+                repo_name = gh_repo_input.strip().split("/")[-1]
+
+                # Determine branches for PR workflow
+                target_branch = gh_branch_input.strip() or "main"
+                pr_target = None
+                if gh_create_pr and target_branch == "main":
+                    target_branch = "forge-ai"
+                    pr_target = "main"
+                elif gh_create_pr:
+                    pr_target = gh_branch_input.strip()
+
+                push_result = gh.push_files(
+                    owner=owner,
+                    repo=repo_name,
+                    files=dict(vfs.files),
+                    branch=target_branch,
+                    commit_msg=gh_commit_msg or "⚡ Forge AI — update",
+                    create_pr_to=pr_target,
+                    enable_pages=gh_enable_pages,
+                    log_fn=gh_log,
+                )
+
+                active_proj()["github_repo"] = repo_name
+                active_proj()["github_branch"] = target_branch
+                active_proj()["github_last_push"] = push_result
+                if push_result.get("pages_url"):
+                    active_proj()["github_pages_url"] = push_result["pages_url"]
+
+                st.session_state["gh_log"] = gh_log_lines
+
+            except Exception as e:
+                st.error(f"Push failed: {e}")
+                gh_log_lines.append(f"✗ Error: {e}")
+                st.session_state["gh_log"] = gh_log_lines
+
+        st.rerun()
+
+    # ── Push results ─────────────────────────
+    last_push = active_proj().get("github_last_push")
+    if last_push:
+        st.markdown('<div class="gh-card">', unsafe_allow_html=True)
+        st.markdown("**Last sync result**")
+
+        repo_url = last_push.get("repo_url", "")
+        branch   = last_push.get("branch", "")
+        pages    = last_push.get("pages_url", "")
+        pr_url   = last_push.get("pr_url", "")
+        changed  = last_push.get("changed", 0)
+        skipped  = last_push.get("skipped", 0)
+
+        badges = [
+            f'<span class="gh-badge">✓ {changed} file{"s" if changed != 1 else ""} pushed</span>',
+            f'<span class="gh-badge-purple">⊘ {skipped} unchanged</span>',
+        ]
+        st.markdown(" ".join(badges), unsafe_allow_html=True)
+
+        links = []
+        if repo_url:
+            links.append(f'<a href="{repo_url}/tree/{branch}" target="_blank" '
+                         f'style="color:#a78bfa;">📁 {repo_url.replace("https://github.com/","")}/{branch}</a>')
+        if pr_url:
+            links.append(f'<a href="{pr_url}" target="_blank" style="color:#f9a8d4;">📬 View Pull Request</a>')
+        if pages:
+            links.append(f'<a href="{pages}" target="_blank" style="color:#56d364;">🌐 GitHub Pages: {pages}</a>')
+
+        for link in links:
+            st.markdown(link, unsafe_allow_html=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Push log ─────────────────────────────
+    gh_log_display = st.session_state.get("gh_log", [])
+    if gh_log_display:
+        with st.expander("Push log", expanded=True):
+            st.markdown(
+                '<div class="build-log">'
+                + "<br>".join(f"› {l}" for l in gh_log_display)
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+
+    st.divider()
+
+    # ── Help box ─────────────────────────────
+    with st.expander("📖 How to set up a GitHub token"):
+        st.markdown("""
+**Create a Fine-grained Personal Access Token:**
+
+1. Go to **github.com → Settings → Developer settings → Personal access tokens → Fine-grained tokens**
+2. Click **Generate new token**
+3. Set an expiration (90 days recommended)
+4. Under **Repository permissions**, grant:
+   - **Contents**: Read and Write
+   - **Pages**: Read and Write
+   - **Pull requests**: Read and Write (if using PR workflow)
+5. Copy the token and paste it above
+
+The token is stored only in your browser session and never sent anywhere except the GitHub API.
+        """)
+
+
+# ──────────── TAB 5 : HISTORY ───────────────
+with main_tabs[4]:
     history = active_proj()["history"]
     if not history:
         st.info("No conversation history yet.")
@@ -1094,4 +1572,3 @@ with main_tabs[3]:
                 {icon}&nbsp;&nbsp;{text}</div>""",
                 unsafe_allow_html=True,
             )
-
