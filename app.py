@@ -7,6 +7,9 @@ import tempfile
 import threading
 import http.server
 import socketserver
+import uuid
+import zipfile
+import io
 from pathlib import Path
 
 import requests
@@ -497,24 +500,113 @@ hr { border-color: #1e1e2e !important; }
 # SESSION STATE INIT
 # ─────────────────────────────────────────────
 def init_state():
-    defaults = {
-        "vfs": None,
-        "history": [],        # list of {"role": "user"|"agent", "text": str}
-        "chat_history": [],   # list of {"role": "user"|"assistant", "content": str}
-        "build_log": [],
-        "selected_file": None,
-        "project_name": "untitled",
-        "last_preview_html": None,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-    if st.session_state["vfs"] is None:
+    if "projects" not in st.session_state:
+        first_id = str(uuid.uuid4())[:8]
+        st.session_state["projects"] = {
+            first_id: {
+                "name": "untitled",
+                "chat_history": [],
+                "build_log": [],
+                "history": [],
+                "last_preview_html": None,
+                "vfs_files": {},
+                "published_url": None,
+            }
+        }
+        st.session_state["active_project"] = first_id
+
+    if "active_project" not in st.session_state:
+        st.session_state["active_project"] = list(st.session_state["projects"].keys())[0]
+
+    # Legacy compat keys (point to active project)
+    ap = st.session_state["active_project"]
+    proj = st.session_state["projects"][ap]
+
+    # Ensure VFS root exists for active project
+    if "vfs_roots" not in st.session_state:
+        st.session_state["vfs_roots"] = {}
+    if ap not in st.session_state["vfs_roots"]:
+        st.session_state["vfs_roots"][ap] = tempfile.mkdtemp(prefix=f"forge_{ap}_")
+
+    # Sync VFS files into session keys VirtualFS expects
+    st.session_state["vfs_files"] = proj["vfs_files"]
+    st.session_state["vfs_root"]  = st.session_state["vfs_roots"][ap]
+
+    # Legacy single-project keys
+    for k, pk in [("history","history"),("chat_history","chat_history"),
+                  ("build_log","build_log"),("last_preview_html","last_preview_html")]:
+        st.session_state[k] = proj[pk]
+
+    if "selected_file" not in st.session_state:
+        st.session_state["selected_file"] = None
+    if "vfs" not in st.session_state or st.session_state.get("_last_ap") != ap:
         st.session_state["vfs"] = VirtualFS()
+        st.session_state["_last_ap"] = ap
+
+
+def save_project():
+    """Flush session-state back into the active project dict."""
+    ap = st.session_state["active_project"]
+    proj = st.session_state["projects"][ap]
+    proj["vfs_files"]          = st.session_state["vfs_files"]
+    proj["history"]            = st.session_state["history"]
+    proj["chat_history"]       = st.session_state["chat_history"]
+    proj["build_log"]          = st.session_state["build_log"]
+    proj["last_preview_html"]  = st.session_state["last_preview_html"]
+
+
+def new_project():
+    """Create a brand-new project and switch to it."""
+    save_project()
+    pid = str(uuid.uuid4())[:8]
+    st.session_state["projects"][pid] = {
+        "name": "untitled",
+        "chat_history": [],
+        "build_log": [],
+        "history": [],
+        "last_preview_html": None,
+        "vfs_files": {},
+        "published_url": None,
+    }
+    st.session_state["active_project"] = pid
+    st.session_state["selected_file"] = None
+    st.session_state["_last_ap"] = None   # force VFS re-init
+
+
+def switch_project(pid: str):
+    save_project()
+    st.session_state["active_project"] = pid
+    st.session_state["selected_file"] = None
+    st.session_state["_last_ap"] = None
 
 
 init_state()
 vfs: VirtualFS = st.session_state["vfs"]
+
+
+# ─────────────────────────────────────────────
+# PUBLISH HELPER  (Netlify Drop — no login needed)
+# ─────────────────────────────────────────────
+def publish_to_netlify(vfs: VirtualFS) -> str:
+    """
+    Zip all VFS files and deploy to Netlify Drop.
+    Returns the live URL.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path, content in vfs.files.items():
+            zf.writestr(path, content)
+    buf.seek(0)
+
+    resp = requests.post(
+        "https://api.netlify.com/api/v1/sites",
+        headers={"Content-Type": "application/zip"},
+        data=buf.read(),
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return f"https://{data['subdomain']}.netlify.app"
 
 
 # ─────────────────────────────────────────────
@@ -523,12 +615,62 @@ vfs: VirtualFS = st.session_state["vfs"]
 with st.sidebar:
     st.markdown("## ⚡ Forge AI")
     st.caption("Build apps at the speed of thought")
+
+    # ── New Chat button ───────────────────────
+    if st.button("✦ New Chat", type="primary", use_container_width=True):
+        new_project()
+        st.rerun()
+
     st.divider()
 
-    # File tree
-    st.markdown("**Project Files**")
-    file_list = vfs.list_files()
+    # ── Project list ──────────────────────────
+    st.markdown("**Chats**")
+    ap = st.session_state["active_project"]
+    for pid, pdata in st.session_state["projects"].items():
+        is_active = pid == ap
+        label = pdata["name"]
+        pub = pdata.get("published_url")
+        display = f"{'▶ ' if is_active else ''}{label}"
+        col_p, col_del = st.columns([5, 1])
+        with col_p:
+            btn_style = "primary" if is_active else "secondary"
+            if st.button(display, key=f"proj_{pid}", use_container_width=True,
+                         type=btn_style if is_active else "secondary"):
+                if not is_active:
+                    switch_project(pid)
+                    st.rerun()
+        with col_del:
+            if len(st.session_state["projects"]) > 1:
+                if st.button("✕", key=f"projdel_{pid}"):
+                    save_project()
+                    del st.session_state["projects"][pid]
+                    remaining = list(st.session_state["projects"].keys())
+                    st.session_state["active_project"] = remaining[0]
+                    st.session_state["_last_ap"] = None
+                    st.rerun()
+        if pub:
+            st.markdown(
+                f'<a href="{pub}" target="_blank" style="font-family:IBM Plex Mono,monospace;'
+                f'font-size:10px;color:#7c6af7;text-decoration:none;">🌐 {pub.replace("https://","")}</a>',
+                unsafe_allow_html=True,
+            )
 
+    st.divider()
+
+    # ── Active project name ───────────────────
+    proj_name = st.text_input(
+        "Project name",
+        value=st.session_state["projects"][ap]["name"],
+        label_visibility="collapsed",
+        placeholder="project-name",
+    )
+    if proj_name != st.session_state["projects"][ap]["name"]:
+        st.session_state["projects"][ap]["name"] = proj_name
+        st.rerun()
+
+    # ── File tree ─────────────────────────────
+    st.markdown("**Files**")
+    file_list = vfs.list_files()
     if not file_list:
         st.caption("No files yet — build something!")
     else:
@@ -541,34 +683,28 @@ with st.sidebar:
             with col2:
                 if st.button("✕", key=f"del_{f}"):
                     vfs.delete(f)
+                    save_project()
                     if st.session_state["selected_file"] == f:
                         st.session_state["selected_file"] = None
                     st.rerun()
 
     st.divider()
 
-    # New / Clear project
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("🗑 Clear", use_container_width=True):
-            vfs.clear()
-            st.session_state["history"] = []
-            st.session_state["build_log"] = []
-            st.session_state["selected_file"] = None
-            st.session_state["last_preview_html"] = None
-            st.rerun()
-    with col_b:
-        project_name = st.text_input(
-            "Project name",
-            value=st.session_state["project_name"],
-            label_visibility="collapsed",
-            placeholder="project-name",
-        )
-        st.session_state["project_name"] = project_name
+    # ── Clear current project ─────────────────
+    if st.button("🗑 Clear project", use_container_width=True):
+        vfs.clear()
+        st.session_state["history"] = []
+        st.session_state["chat_history"] = []
+        st.session_state["build_log"] = []
+        st.session_state["selected_file"] = None
+        st.session_state["last_preview_html"] = None
+        st.session_state["projects"][ap]["published_url"] = None
+        save_project()
+        st.rerun()
 
     st.divider()
 
-    # GitHub sync (optional)
+    # ── GitHub sync (optional) ────────────────
     with st.expander("☁️ GitHub Sync (optional)"):
         github_token = st.text_input("GitHub Token", type="password",
                                      key="gh_token")
@@ -712,6 +848,7 @@ with main_tabs[0]:
                 html = vfs.get_entry_html()
                 if html:
                     st.session_state["last_preview_html"] = vfs.inject_css_js(html)
+                save_project()
 
                 reply = f"✅ {summary} — switch to the Preview tab to see it!"
                 st.session_state["chat_history"].append(
@@ -755,29 +892,56 @@ with main_tabs[1]:
     if not preview_html:
         st.info("Build something first and the live preview will appear here.")
     else:
-        # Bump a cache-buster so the iframe reloads on every rerun
-        cache_bust = hashlib.md5(preview_html.encode()).hexdigest()[:8]
+        ap   = st.session_state["active_project"]
+        proj = st.session_state["projects"][ap]
 
+        # ── Top bar: publish + download ──────────────
+        pub_url = proj.get("published_url")
+        col_pub, col_dl, col_info = st.columns([2, 2, 4])
+
+        with col_pub:
+            if st.button("🌐 Publish", type="primary", use_container_width=True,
+                         help="Deploy to a free random Netlify URL instantly"):
+                if not vfs.list_files():
+                    st.error("Nothing to publish.")
+                else:
+                    with st.spinner("Publishing to Netlify…"):
+                        try:
+                            url = publish_to_netlify(vfs)
+                            proj["published_url"] = url
+                            save_project()
+                            st.success(f"Live at [{url}]({url})")
+                            st.balloons()
+                        except Exception as e:
+                            st.error(f"Publish failed: {e}")
+        with col_dl:
+            st.download_button(
+                "⬇️ Download",
+                data=preview_html,
+                file_name="index.html",
+                mime="text/html",
+                use_container_width=True,
+            )
+        with col_info:
+            if pub_url:
+                st.markdown(
+                    f'🌐 Published: <a href="{pub_url}" target="_blank" '
+                    f'style="color:#a78bfa;">{pub_url}</a>',
+                    unsafe_allow_html=True,
+                )
+
+        st.divider()
+
+        # ── iframe preview ───────────────────────────
+        cache_bust = hashlib.md5(preview_html.encode()).hexdigest()[:8]
         st.markdown(
-            f"**Live Preview** &nbsp;·&nbsp; "
-            f"<span style='font-family:monospace;color:#606080;font-size:12px'>"
-            f"hash:{cache_bust}</span>",
+            f"<span style='font-family:monospace;color:#606080;font-size:11px'>"
+            f"local preview · hash:{cache_bust}</span>",
             unsafe_allow_html=True,
         )
-
-        # Render directly via srcdoc (works everywhere, no server needed)
         encoded = base64.b64encode(preview_html.encode()).decode()
         iframe_src = f"data:text/html;base64,{encoded}"
-
-        st.components.v1.iframe(iframe_src, height=680, scrolling=True)
-
-        # Download button
-        st.download_button(
-            "⬇️ Download index.html",
-            data=preview_html,
-            file_name="index.html",
-            mime="text/html",
-        )
+        st.components.v1.iframe(iframe_src, height=650, scrolling=True)
 
 
 # ──────────── TAB 3 : EDITOR ────────────────
