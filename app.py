@@ -220,7 +220,6 @@ class AIClient:
 # ─────────────────────────────────────────────
 # AGENT CORE
 # ─────────────────────────────────────────────
-# System prompts for different modes
 AGENT_SYSTEM_PROMPT = """IMPORTANT: You are Forge, an autonomous web app builder. You output ONLY raw JSON — no prose, no markdown, no explanations, no web searches.
 
 TASK: Make exactly the change the user requests. Nothing more.
@@ -552,6 +551,7 @@ def new_project():
         "history": [],
         "last_preview_html": None,
         "vfs_files": {},
+        "vfs_root": tempfile.mkdtemp(prefix=f"forge_{pid}_"),
         "published_url": None,
     }
     st.session_state["active_project"] = pid
@@ -830,27 +830,18 @@ with main_tabs[0]:
                 active_proj()["history"].append({"role": "agent", "text": summary})
 
                 # Refresh preview
-               html = vfs.get_entry_html()
+                html = vfs.get_entry_html()
+                if html:
+                    rendered_html = vfs.inject_css_js(html)
+                    active_proj()["last_preview_html"] = rendered_html
+                    st.session_state["preview_ready"] = True
 
-if html:
-    rendered_html = vfs.inject_css_js(html)
+                save_project()
 
-    # save preview into project
-    active_proj()["last_preview_html"] = rendered_html
-
-    # force refresh flag
-    st.session_state["preview_ready"] = True
-
-save_project()
-
-reply = "✅ Build complete — preview updated!"
-
-active_proj()["chat_history"].append(
-    {
-        "role": "assistant",
-        "content": reply
-    }
-)
+                reply = "✅ Build complete — preview updated!"
+                active_proj()["chat_history"].append(
+                    {"role": "assistant", "content": reply}
+                )
 
             else:
                 # ── CHAT PATH ──
@@ -884,7 +875,7 @@ active_proj()["chat_history"].append(
 
 # ──────────── TAB 2 : PREVIEW ───────────────
 with main_tabs[1]:
-    preview_html = st.session_state.get("last_preview_html")
+    preview_html = active_proj().get("last_preview_html")  # FIX: was st.session_state.get(...)
 
     if not preview_html:
         st.info("Build something first and the live preview will appear here.")
@@ -929,17 +920,12 @@ with main_tabs[1]:
 
         st.divider()
 
-       # ── Preview ───────────────────────────
-preview_html = active_proj().get("last_preview_html")
-
-if preview_html:
-    st.components.v1.html(
-        preview_html,
-        height=700,
-        scrolling=True
-    )
-else:
-    st.warning("No preview available yet.")
+        # ── Preview ───────────────────────────────────
+        st.components.v1.html(
+            preview_html,
+            height=700,
+            scrolling=True,
+        )
 
 
 # ──────────── TAB 3 : EDITOR ────────────────
