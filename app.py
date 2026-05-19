@@ -35,43 +35,44 @@ PREVIEW_PORT = 8765   # local HTTP server for live preview
 # VIRTUAL FILESYSTEM  (in-memory + disk-backed)
 # ─────────────────────────────────────────────
 class VirtualFS:
-    """In-memory virtual project filesystem, optionally persisted to a temp dir."""
-
-    def __init__(self):
-        if "vfs_files" not in st.session_state:
-            st.session_state["vfs_files"] = {}          # path -> content (str)
-        if "vfs_root" not in st.session_state:
-            st.session_state["vfs_root"] = tempfile.mkdtemp(prefix="forge_")
-
-    # ── read/write ──────────────────────────────
-    @property
-    def files(self):
-        return st.session_state["vfs_files"]
+    """
+    Virtual filesystem that reads/writes DIRECTLY into the active project dict.
+    No intermediate session_state copies — eliminates the stale-reference bug.
+    """
 
     @property
-    def root(self):
-        return st.session_state["vfs_root"]
+    def _proj(self) -> dict:
+        ap = st.session_state["active_project"]
+        return st.session_state["projects"][ap]
+
+    @property
+    def files(self) -> dict:
+        return self._proj["vfs_files"]
+
+    @property
+    def root(self) -> str:
+        return self._proj["vfs_root"]
 
     def write(self, path: str, content: str):
-        self.files[path] = content
+        self._proj["vfs_files"][path] = content
         disk_path = Path(self.root) / path
         disk_path.parent.mkdir(parents=True, exist_ok=True)
         disk_path.write_text(content, encoding="utf-8")
 
     def read(self, path: str) -> str | None:
-        return self.files.get(path)
+        return self._proj["vfs_files"].get(path)
 
     def delete(self, path: str):
-        self.files.pop(path, None)
+        self._proj["vfs_files"].pop(path, None)
         disk_path = Path(self.root) / path
         if disk_path.exists():
             disk_path.unlink()
 
     def list_files(self) -> list[str]:
-        return sorted(self.files.keys())
+        return sorted(self._proj["vfs_files"].keys())
 
     def clear(self):
-        st.session_state["vfs_files"] = {}
+        self._proj["vfs_files"] = {}
         root = Path(self.root)
         for f in root.rglob("*"):
             if f.is_file():
@@ -499,6 +500,12 @@ hr { border-color: #1e1e2e !important; }
 # ─────────────────────────────────────────────
 # SESSION STATE INIT
 # ─────────────────────────────────────────────
+def active_proj() -> dict:
+    """Return the active project dict directly — single source of truth."""
+    ap = st.session_state["active_project"]
+    return st.session_state["projects"][ap]
+
+
 def init_state():
     if "projects" not in st.session_state:
         first_id = str(uuid.uuid4())[:8]
@@ -510,6 +517,7 @@ def init_state():
                 "history": [],
                 "last_preview_html": None,
                 "vfs_files": {},
+                "vfs_root": tempfile.mkdtemp(prefix=f"forge_{first_id}_"),
                 "published_url": None,
             }
         }
@@ -518,41 +526,19 @@ def init_state():
     if "active_project" not in st.session_state:
         st.session_state["active_project"] = list(st.session_state["projects"].keys())[0]
 
-    # Legacy compat keys (point to active project)
-    ap = st.session_state["active_project"]
-    proj = st.session_state["projects"][ap]
-
-    # Ensure VFS root exists for active project
-    if "vfs_roots" not in st.session_state:
-        st.session_state["vfs_roots"] = {}
-    if ap not in st.session_state["vfs_roots"]:
-        st.session_state["vfs_roots"][ap] = tempfile.mkdtemp(prefix=f"forge_{ap}_")
-
-    # Sync VFS files into session keys VirtualFS expects
-    st.session_state["vfs_files"] = proj["vfs_files"]
-    st.session_state["vfs_root"]  = st.session_state["vfs_roots"][ap]
-
-    # Legacy single-project keys
-    for k, pk in [("history","history"),("chat_history","chat_history"),
-                  ("build_log","build_log"),("last_preview_html","last_preview_html")]:
-        st.session_state[k] = proj[pk]
+    # Ensure every project has a vfs_root on disk
+    for pid, pdata in st.session_state["projects"].items():
+        if "vfs_root" not in pdata or not Path(pdata["vfs_root"]).exists():
+            pdata["vfs_root"] = tempfile.mkdtemp(prefix=f"forge_{pid}_")
 
     if "selected_file" not in st.session_state:
         st.session_state["selected_file"] = None
-    if "vfs" not in st.session_state or st.session_state.get("_last_ap") != ap:
-        st.session_state["vfs"] = VirtualFS()
-        st.session_state["_last_ap"] = ap
+    # VirtualFS is now stateless — no need to store it in session_state
 
 
 def save_project():
-    """Flush session-state back into the active project dict."""
-    ap = st.session_state["active_project"]
-    proj = st.session_state["projects"][ap]
-    proj["vfs_files"]          = st.session_state["vfs_files"]
-    proj["history"]            = st.session_state["history"]
-    proj["chat_history"]       = st.session_state["chat_history"]
-    proj["build_log"]          = st.session_state["build_log"]
-    proj["last_preview_html"]  = st.session_state["last_preview_html"]
+    """No-op: all writes go directly to active_proj() dict now."""
+    pass
 
 
 def new_project():
@@ -581,7 +567,7 @@ def switch_project(pid: str):
 
 
 init_state()
-vfs: VirtualFS = st.session_state["vfs"]
+vfs = VirtualFS()  # stateless — all data lives in active_proj()
 
 
 # ─────────────────────────────────────────────
@@ -693,13 +679,12 @@ with st.sidebar:
     # ── Clear current project ─────────────────
     if st.button("🗑 Clear project", use_container_width=True):
         vfs.clear()
-        st.session_state["history"] = []
-        st.session_state["chat_history"] = []
-        st.session_state["build_log"] = []
+        active_proj()["history"] = []
+        active_proj()["chat_history"] = []
+        active_proj()["build_log"] = []
+        active_proj()["last_preview_html"] = None
+        active_proj()["published_url"] = None
         st.session_state["selected_file"] = None
-        st.session_state["last_preview_html"] = None
-        st.session_state["projects"][ap]["published_url"] = None
-        save_project()
         st.rerun()
 
     st.divider()
@@ -736,7 +721,7 @@ with main_tabs[0]:
     # ── Chat history display ──────────────────────────
     chat_container = st.container()
     with chat_container:
-        if not st.session_state["chat_history"]:
+        if not active_proj()["chat_history"]:
             st.markdown(
                 '''<div style="text-align:center;padding:40px 0 20px;
                     font-family:IBM Plex Mono,monospace;color:#606080;font-size:13px;">
@@ -744,7 +729,7 @@ with main_tabs[0]:
                 </div>''',
                 unsafe_allow_html=True,
             )
-        for msg in st.session_state["chat_history"]:
+        for msg in active_proj()["chat_history"]:
             role = msg["role"]
             text = msg["content"]
             is_user = role == "user"
@@ -804,7 +789,7 @@ with main_tabs[0]:
             user_text = prompt.strip()
 
             # Add user message to chat
-            st.session_state["chat_history"].append(
+            active_proj()["chat_history"].append(
                 {"role": "user", "content": user_text}
             )
 
@@ -821,13 +806,13 @@ with main_tabs[0]:
                         result = run_agent(ai, vfs, user_text, existing)
                     except json.JSONDecodeError as e:
                         err = f"AI returned invalid JSON — try rephrasing. ({e})"
-                        st.session_state["chat_history"].append(
+                        active_proj()["chat_history"].append(
                             {"role": "assistant", "content": err}
                         )
                         st.rerun()
                     except Exception as e:
                         err = f"Error: {e}"
-                        st.session_state["chat_history"].append(
+                        active_proj()["chat_history"].append(
                             {"role": "assistant", "content": err}
                         )
                         st.rerun()
@@ -840,18 +825,18 @@ with main_tabs[0]:
                 for a in actions:
                     icon = {"create": "➕", "edit": "✏️", "delete": "🗑"}.get(a.get("type"), "•")
                     log_lines.append(f"{icon}  {a.get('path','?')}")
-                st.session_state["build_log"].extend(log_lines)
-                st.session_state["history"].append({"role": "user",  "text": user_text})
-                st.session_state["history"].append({"role": "agent", "text": summary})
+                active_proj()["build_log"].extend(log_lines)
+                active_proj()["history"].append({"role": "user",  "text": user_text})
+                active_proj()["history"].append({"role": "agent", "text": summary})
 
                 # Refresh preview
                 html = vfs.get_entry_html()
                 if html:
-                    st.session_state["last_preview_html"] = vfs.inject_css_js(html)
+                    active_proj()["last_preview_html"] = vfs.inject_css_js(html)
                 save_project()
 
                 reply = f"✅ {summary} — switch to the Preview tab to see it!"
-                st.session_state["chat_history"].append(
+                active_proj()["chat_history"].append(
                     {"role": "assistant", "content": reply}
                 )
 
@@ -860,7 +845,7 @@ with main_tabs[0]:
                 # Build conversation list for the AI (role: user/assistant only)
                 conversation = [
                     {"role": m["role"], "content": m["content"]}
-                    for m in st.session_state["chat_history"]
+                    for m in active_proj()["chat_history"]
                 ]
                 with st.spinner("Thinking…"):
                     try:
@@ -868,18 +853,18 @@ with main_tabs[0]:
                     except Exception as e:
                         reply = f"Sorry, I hit an error: {e}"
 
-                st.session_state["chat_history"].append(
+                active_proj()["chat_history"].append(
                     {"role": "assistant", "content": reply}
                 )
 
             st.rerun()
 
     # Build log (persistent)
-    if st.session_state["build_log"]:
+    if active_proj()["build_log"]:
         with st.expander("Build Log", expanded=False):
             st.markdown(
                 '<div class="build-log">'
-                + "<br>".join(f"› {l}" for l in st.session_state["build_log"][-60:])
+                + "<br>".join(f"› {l}" for l in active_proj()["build_log"][-60:])
                 + "</div>",
                 unsafe_allow_html=True,
             )
@@ -985,7 +970,7 @@ with main_tabs[2]:
                 # Refresh preview
                 html = vfs.get_entry_html()
                 if html:
-                    st.session_state["last_preview_html"] = vfs.inject_css_js(html)
+                    active_proj()["last_preview_html"] = vfs.inject_css_js(html)
                 st.success("Saved!")
                 st.rerun()
         with col_revert:
@@ -1004,7 +989,7 @@ with main_tabs[2]:
 
 # ──────────── TAB 4 : HISTORY ───────────────
 with main_tabs[3]:
-    history = st.session_state["history"]
+    history = active_proj()["history"]
     if not history:
         st.info("No conversation history yet.")
     else:
